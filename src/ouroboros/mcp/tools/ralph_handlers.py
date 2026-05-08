@@ -30,6 +30,8 @@ from ouroboros.mcp.types import (
 )
 from ouroboros.persistence.event_store import EventStore
 from ouroboros.ralph_loop import (
+    DEFAULT_GRADE_REGRESSION_WINDOW,
+    DEFAULT_OSCILLATION_WINDOW,
     DEFAULT_PER_ITERATION_TIMEOUT_SECONDS,
     EvolveStepLike,
     RalphLoopConfig,
@@ -39,6 +41,7 @@ from ouroboros.ralph_loop import (
 MAX_RALPH_GENERATIONS = 10
 MIN_PER_ITERATION_TIMEOUT_SECONDS = 30.0
 MAX_PER_ITERATION_TIMEOUT_SECONDS = 7200.0
+MIN_PROGRESS_WINDOW = 2  # smallest window where strict-decrease / repeat checks are meaningful
 
 
 @dataclass
@@ -138,6 +141,34 @@ class RalphHandler:
                     required=False,
                     default=DEFAULT_PER_ITERATION_TIMEOUT_SECONDS,
                 ),
+                MCPToolParameter(
+                    name="oscillation_window",
+                    type=ToolInputType.INTEGER,
+                    description=(
+                        "Number of trailing iterations whose findings_hash must "
+                        "match (and QA must not have passed) to stop with "
+                        "stop_reason='oscillation_detected'. Default: 3. "
+                        f"Range: {MIN_PROGRESS_WINDOW}-{MAX_RALPH_GENERATIONS}. "
+                        "Values < 2 are rejected because a single iteration "
+                        "cannot oscillate with itself."
+                    ),
+                    required=False,
+                    default=DEFAULT_OSCILLATION_WINDOW,
+                ),
+                MCPToolParameter(
+                    name="grade_regression_window",
+                    type=ToolInputType.INTEGER,
+                    description=(
+                        "Number of trailing iterations whose non-None grades must "
+                        "strictly decrease to stop with "
+                        "stop_reason='grade_regressing'. Default: 2. "
+                        f"Range: {MIN_PROGRESS_WINDOW}-{MAX_RALPH_GENERATIONS}. "
+                        "Values < 2 are rejected because strict-decrease "
+                        "requires at least two grades to compare."
+                    ),
+                    required=False,
+                    default=DEFAULT_GRADE_REGRESSION_WINDOW,
+                ),
             ),
         )
 
@@ -178,13 +209,12 @@ class RalphHandler:
                 )
             )
 
+        raw_timeout = arguments.get(
+            "per_iteration_timeout_seconds",
+            DEFAULT_PER_ITERATION_TIMEOUT_SECONDS,
+        )
         try:
-            per_iteration_timeout_seconds = float(
-                arguments.get(
-                    "per_iteration_timeout_seconds",
-                    DEFAULT_PER_ITERATION_TIMEOUT_SECONDS,
-                )
-            )
+            per_iteration_timeout_seconds = float(raw_timeout)
         except (TypeError, ValueError):
             return Result.err(
                 MCPToolError(
@@ -193,6 +223,9 @@ class RalphHandler:
                 )
             )
         if not math.isfinite(per_iteration_timeout_seconds):
+            # Reject NaN / +inf / -inf: range comparisons are always False for
+            # NaN and asyncio.wait_for(timeout=inf) defeats the bounded-loop
+            # contract the public API advertises.
             return Result.err(
                 MCPToolError(
                     "per_iteration_timeout_seconds must be a finite number",
@@ -208,6 +241,41 @@ class RalphHandler:
                     "per_iteration_timeout_seconds must be between "
                     f"{MIN_PER_ITERATION_TIMEOUT_SECONDS:g} and "
                     f"{MAX_PER_ITERATION_TIMEOUT_SECONDS:g}",
+                    tool_name="ouroboros_ralph",
+                )
+            )
+
+        oscillation_window_result = _coerce_window(
+            arguments.get("oscillation_window", DEFAULT_OSCILLATION_WINDOW),
+            field_name="oscillation_window",
+        )
+        if isinstance(oscillation_window_result, MCPToolError):
+            return Result.err(oscillation_window_result)
+        oscillation_window = oscillation_window_result
+        if oscillation_window < MIN_PROGRESS_WINDOW or oscillation_window > MAX_RALPH_GENERATIONS:
+            return Result.err(
+                MCPToolError(
+                    "oscillation_window must be between "
+                    f"{MIN_PROGRESS_WINDOW} and {MAX_RALPH_GENERATIONS}",
+                    tool_name="ouroboros_ralph",
+                )
+            )
+
+        grade_regression_window_result = _coerce_window(
+            arguments.get("grade_regression_window", DEFAULT_GRADE_REGRESSION_WINDOW),
+            field_name="grade_regression_window",
+        )
+        if isinstance(grade_regression_window_result, MCPToolError):
+            return Result.err(grade_regression_window_result)
+        grade_regression_window = grade_regression_window_result
+        if (
+            grade_regression_window < MIN_PROGRESS_WINDOW
+            or grade_regression_window > MAX_RALPH_GENERATIONS
+        ):
+            return Result.err(
+                MCPToolError(
+                    "grade_regression_window must be between "
+                    f"{MIN_PROGRESS_WINDOW} and {MAX_RALPH_GENERATIONS}",
                     tool_name="ouroboros_ralph",
                 )
             )
@@ -229,6 +297,8 @@ class RalphHandler:
             project_dir=arguments.get("project_dir"),
             max_generations=max_generations,
             per_iteration_timeout_seconds=per_iteration_timeout_seconds,
+            oscillation_window=oscillation_window,
+            grade_regression_window=grade_regression_window,
         )
 
         if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
@@ -241,6 +311,8 @@ class RalphHandler:
                 project_dir=config.project_dir,
                 max_generations=config.max_generations,
                 per_iteration_timeout_seconds=config.per_iteration_timeout_seconds,
+                oscillation_window=config.oscillation_window,
+                grade_regression_window=config.grade_regression_window,
             )
             await self._event_store.initialize()
             await emit_subagent_dispatched_event(
@@ -298,3 +370,28 @@ class RalphHandler:
 def _normalize_lineage_id(value: Any) -> str:
     """Normalize user-provided lineage IDs before starting a mutating Ralph loop."""
     return value.strip() if isinstance(value, str) else ""
+
+
+def _coerce_window(value: Any, *, field_name: str) -> int | MCPToolError:
+    """Strictly coerce an MCP integer field, refusing fractional float truncation.
+
+    The MCP parameter is declared ``INTEGER``. ``int(2.9)`` would silently
+    truncate to ``2``, changing loop-stop semantics behind the caller's back,
+    so reject any float whose value is not exactly integral. Booleans flow
+    through ``int(True) == 1`` and remain handled by the downstream range
+    check (``True``/``False`` end up as 1/0, both below the floor).
+    """
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return MCPToolError(
+            f"{field_name} must be an integer",
+            tool_name="ouroboros_ralph",
+        )
+    # ``isinstance(bool, int)`` is True, but bool truncation is harmless here.
+    if isinstance(value, float) and coerced != value:
+        return MCPToolError(
+            f"{field_name} must be an integer (got fractional value)",
+            tool_name="ouroboros_ralph",
+        )
+    return coerced
