@@ -12,7 +12,9 @@ import time
 from typing import Any, Protocol
 
 from ouroboros.auto.adapters import EvaluateResult, LateralResult
+from ouroboros.auto.answerer import AutoAnswerer
 from ouroboros.auto.blocker_attribution import record_authoring_backend
+from ouroboros.auto.domain_profile import DEFAULT_REGISTRY
 from ouroboros.auto.grading import GradeGate, deterministic_floor
 from ouroboros.auto.handoff_contract import (
     IDEMPOTENCY_KEY_FIELD,
@@ -259,6 +261,10 @@ class AutoPipeline:
             state.complete_product = True
         elif state.complete_product and not self.complete_product:
             self.complete_product = True
+        # Q00/ouroboros#809 P3 PR-4: active domain profile injection is gated
+        # to the interview phases below, where ``interview_driver.answerer`` is
+        # actually used.  Later resume/result paths must not depend on the
+        # mutable process-local profile registry.
         # Validate the persisted Seed artifact BEFORE any other path can
         # trigger a state-validating save. ``AutoStore.save`` re-validates the
         # full state, so a malformed ``seed_artifact`` would otherwise raise a
@@ -396,6 +402,14 @@ class AutoPipeline:
                 )
                 self._save(state)
             else:
+                _answerer = getattr(self.interview_driver, "answerer", None)
+                if _answerer is not None:
+                    try:
+                        _apply_active_profile(state, _answerer)
+                    except ValueError as exc:
+                        state.mark_blocked(str(exc), tool_name="domain_profile_registry")
+                        self._save(state)
+                        return self._result(state, ledger, blocker=state.last_error)
                 interview_phase_timeout = state.phase_timeout_seconds(AutoPhase.INTERVIEW)
                 interview_timeout = self._deadline_capped_timeout(state, interview_phase_timeout)
                 try:
@@ -2374,6 +2388,7 @@ def _recoverable_phase_for_tool(tool_name: str | None) -> AutoPhase | None:
         "interview.resume",
         "interview.answer",
         "auto_answerer",
+        "domain_profile_registry",
         "interview_driver",
     }:
         return AutoPhase.INTERVIEW
@@ -2494,3 +2509,28 @@ def _artifact_text(value: object) -> str | None:
     and silently transition to COMPLETE.
     """
     return value if isinstance(value, str) else None
+
+
+# -- PR-4 helper: thread domain profile into answerer -----------------------
+
+
+def _apply_active_profile(state: AutoPipelineState, answerer: AutoAnswerer) -> None:
+    """Resolve ``state.active_domain_profile_name`` and inject into ``answerer``.
+
+    ``None`` is the only value that activates the hardcoded safety hatch.  A
+    non-empty persisted profile name is durable session intent; if the registry
+    cannot resolve it, fail loudly instead of silently downgrading to the coding
+    fallback and authoring Seed content under the wrong domain.
+    When ``answerer`` does not have an ``active_profile`` attribute (e.g. a
+    test double), the call is silently skipped.
+    """
+    if not hasattr(answerer, "active_profile"):
+        return
+    name = getattr(state, "active_domain_profile_name", None)
+    if name:
+        profile = DEFAULT_REGISTRY.get(name)
+        if profile is None:
+            raise ValueError(f"active domain profile is not registered: {name}")
+        answerer.active_profile = profile
+    else:
+        answerer.active_profile = None
