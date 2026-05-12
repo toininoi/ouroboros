@@ -868,6 +868,35 @@ class TestEvolveStepErrors:
         step = result.value
         assert step.action == StepAction.FAILED
 
+    @pytest.mark.asyncio
+    async def test_watchdog_timeout_without_directive_metadata_emits_no_fallback_directive(
+        self,
+    ) -> None:
+        """Watchdog timeout without persisted directive metadata must not synthesize one."""
+        store = await create_event_store()
+        seed = make_seed()
+
+        timeout = GenerationWatchdogTimeout(
+            timeout_kind="no_material_progress_timeout",
+            reason="Generation had no material progress",
+            details={
+                "timeout_kind": "no_material_progress_timeout",
+                "lineage_id": "lin_watchdog_no_metadata",
+                "generation_number": 1,
+            },
+        )
+        loop = make_loop(store, gen_error=timeout)
+
+        result = await loop.evolve_step("lin_watchdog_no_metadata", initial_seed=seed)
+
+        assert result.is_ok
+        step = result.value
+        assert step.action == StepAction.FAILED
+        assert step.generation_result.success is False
+
+        events = await store.replay_lineage("lin_watchdog_no_metadata")
+        assert [event for event in events if event.type == "control.directive.emitted"] == []
+
 
 class TestWatchdogDirectiveEmission:
     """Watchdog timeouts must land on the control-plane directive stream."""
