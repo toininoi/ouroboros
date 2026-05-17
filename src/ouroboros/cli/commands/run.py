@@ -243,18 +243,24 @@ def _load_skip_completed_markers(
 
 
 def _resolve_fat_harness_mode(seed_data: dict[str, Any]) -> bool:
-    """Default CLI runs to fat-harness after #920 PR-5.
+    """Typed evidence plus verifier PASS is the only CLI acceptance path.
 
     ``seed.orchestrator.execution_mode`` was the temporary #920 PR-4 opt-in
-    selector. After the default flip it is accepted only as a no-op
-    compatibility shim so existing seeds and resumptions are not stranded.
+    selector. After #978 P5, ``legacy`` is rejected instead of silently
+    accepting a self-report fallback selector.
     """
     orchestrator_config = seed_data.get("orchestrator")
     if not isinstance(orchestrator_config, dict):
         return True
 
     execution_mode = orchestrator_config.get("execution_mode")
-    if execution_mode not in (None, "", "fat_harness", "legacy"):
+    if execution_mode == "legacy":
+        print_error(
+            "seed.orchestrator.execution_mode='legacy' was removed after #978 P5; "
+            "typed evidence plus verifier PASS is now required for acceptance."
+        )
+        raise typer.Exit(1)
+    if execution_mode not in (None, "", "fat_harness"):
         print_error(
             "seed.orchestrator.execution_mode is no longer configurable after "
             f"the fat-harness default flip (got {execution_mode!r})."
@@ -262,6 +268,28 @@ def _resolve_fat_harness_mode(seed_data: dict[str, Any]) -> bool:
         raise typer.Exit(1)
 
     return True
+
+
+def _resolve_resume_fat_harness_mode(
+    seed_data: dict[str, Any],
+    progress: dict[str, Any],
+) -> bool:
+    """Resolve resume acceptance mode from persisted contract with safe migration.
+
+    New sessions persist ``fat_harness_mode`` at prepare time. Historical
+    sessions may not have that field, so only an explicit historical
+    ``execution_mode: legacy`` selector resumes ungated; unknown/missing state
+    falls back to the conservative typed-evidence gate.
+    """
+    persisted = progress.get("fat_harness_mode")
+    if isinstance(persisted, bool):
+        return persisted
+
+    orchestrator_config = seed_data.get("orchestrator")
+    return not (
+        isinstance(orchestrator_config, dict)
+        and orchestrator_config.get("execution_mode") == "legacy"
+    )
 
 
 def _resolve_max_parallel_workers() -> int:
@@ -385,7 +413,7 @@ async def _run_orchestrator(
         seed_data,
         max_decomposition_depth,
     )
-    resolved_fat_harness_mode = _resolve_fat_harness_mode(seed_data)
+    resolved_fat_harness_mode = False if resume_session else _resolve_fat_harness_mode(seed_data)
     resolved_max_parallel_workers = _resolve_max_parallel_workers()
     externally_satisfied_acs: dict[int, dict[str, Any]] | None = None
     if skip_completed:
@@ -442,6 +470,10 @@ async def _run_orchestrator(
             )
             session_id_for_run = resume_session
             execution_id = reconstructed.value.execution_id
+            resolved_fat_harness_mode = _resolve_resume_fat_harness_mode(
+                seed_data,
+                reconstructed.value.progress,
+            )
         else:
             session_id_for_run = f"orch_{uuid4().hex[:12]}"
             execution_id = f"exec_{uuid4().hex[:12]}"
@@ -656,7 +688,7 @@ def workflow(
     Reads the seed YAML configuration and runs the Ouroboros workflow.
     Orchestrator mode is enabled by default.
 
-    Use --no-orchestrator for legacy standard workflow mode.
+    Use --no-orchestrator only for the non-orchestrated standard workflow path.
     Use --resume to continue a previous session.
     Use --mcp-config to connect to external MCP servers for additional tools.
 

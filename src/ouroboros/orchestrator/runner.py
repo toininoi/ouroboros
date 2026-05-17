@@ -456,9 +456,11 @@ class OrchestratorRunner:
             max_decomposition_depth: Maximum recursive AC decomposition depth.
             max_parallel_workers: Maximum concurrent AC workers for parallel execution.
             fat_harness_mode: Enforce profile typed-evidence validation plus
-                verifier PASS at atomic AC acceptance. CLI `ooo run` enables
-                this by default after #920 PR-5; the constructor default stays
-                False as the internal legacy fallback until #978 P5 removes it.
+                verifier PASS at atomic AC acceptance. Public entrypoints that
+                can support the gate (for example CLI `ooo run`) pass this
+                explicitly; the low-level constructor default stays False so
+                direct runner/resume callers are not silently converted to a
+                stricter contract they cannot satisfy.
         """
         self._adapter = adapter
         self._event_store = event_store
@@ -2044,19 +2046,45 @@ class OrchestratorRunner:
             )
 
         tracker = session_result.value
+        initial_progress: dict[str, Any] = {
+            "fat_harness_mode": self._fat_harness_mode,
+            "messages_processed": 0,
+        }
         if self._task_workspace is not None:
-            progress_result = await self._session_repo.track_progress(
+            initial_progress["workspace"] = self._task_workspace.to_progress_dict()
+        progress_result = await self._session_repo.track_progress(
+            tracker.session_id,
+            initial_progress,
+        )
+        if progress_result.is_err:
+            fail_result = await self._session_repo.mark_failed(
                 tracker.session_id,
-                {"workspace": self._task_workspace.to_progress_dict()},
+                "Failed to persist initial session contract",
+                {
+                    "execution_id": tracker.execution_id,
+                    "fat_harness_mode": self._fat_harness_mode,
+                    "cause": str(progress_result.error),
+                },
             )
-            if progress_result.is_err:
-                log.warning(
-                    "orchestrator.runner.workspace_progress_seed_failed",
-                    session_id=tracker.session_id,
-                    error=str(progress_result.error),
-                )
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
 
-        return Result.ok(tracker)
+            details: dict[str, Any] = {
+                "session_id": tracker.session_id,
+                "execution_id": tracker.execution_id,
+                "fat_harness_mode": self._fat_harness_mode,
+                "cause": str(progress_result.error),
+            }
+            if fail_result.is_err:
+                details["terminal_mark_error"] = str(fail_result.error)
+            return Result.err(
+                OrchestratorError(
+                    message="Failed to persist initial session contract",
+                    details=details,
+                )
+            )
+
+        return Result.ok(tracker.with_progress(initial_progress))
 
     async def execute_precreated_session(
         self,
@@ -3015,8 +3043,8 @@ class OrchestratorRunner:
             return Result.err(
                 OrchestratorError(
                     message=(
-                        "Fat-harness resume is blocked because the legacy resume path "
-                        "cannot enforce typed evidence plus verifier PASS; restart the "
+                        "Resume is blocked because this resume path cannot enforce "
+                        "typed evidence plus verifier PASS; restart the "
                         "run so each AC goes through the fat-harness acceptance gate."
                     ),
                     details={

@@ -14,11 +14,13 @@ from ouroboros.cli.commands.run import (
     _resolve_fat_harness_mode,
     _resolve_max_decomposition_depth,
     _resolve_max_parallel_workers,
+    _resolve_resume_fat_harness_mode,
     _run_orchestrator,
 )
 from ouroboros.core.types import Result
 from ouroboros.evaluation.verification_artifacts import VerificationArtifacts
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.orchestrator.session import SessionTracker
 
 VALID_SEED_DATA = {
     "goal": "Test task",
@@ -81,12 +83,19 @@ def test_resolve_fat_harness_mode_defaults_to_enabled() -> None:
     assert _resolve_fat_harness_mode(VALID_SEED_DATA) is True
 
 
-def test_resolve_fat_harness_mode_accepts_old_execution_mode_as_noop() -> None:
-    """Old PR-4 seeds should resume, but the selector no longer changes mode."""
-    for execution_mode in ("fat_harness", "legacy"):
-        seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": execution_mode}}
+def test_resolve_fat_harness_mode_accepts_fat_harness_execution_mode() -> None:
+    """Explicit fat-harness mode remains accepted after #978 P5."""
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "fat_harness"}}
 
-        assert _resolve_fat_harness_mode(seed_data) is True
+    assert _resolve_fat_harness_mode(seed_data) is True
+
+
+def test_resolve_fat_harness_mode_rejects_legacy_execution_mode() -> None:
+    """#978 P5 removes the legacy self-report fallback selector."""
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    with pytest.raises(typer.Exit):
+        _resolve_fat_harness_mode(seed_data)
 
 
 def test_resolve_fat_harness_mode_rejects_unknown_execution_mode() -> None:
@@ -94,6 +103,22 @@ def test_resolve_fat_harness_mode_rejects_unknown_execution_mode() -> None:
 
     with pytest.raises(typer.Exit):
         _resolve_fat_harness_mode(seed_data)
+
+
+def test_resolve_resume_fat_harness_mode_uses_persisted_contract() -> None:
+    """Resume prefers the durable session contract over seed selectors."""
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    assert _resolve_resume_fat_harness_mode(seed_data, {"fat_harness_mode": True}) is True
+    assert _resolve_resume_fat_harness_mode(seed_data, {"fat_harness_mode": False}) is False
+
+
+def test_resolve_resume_fat_harness_mode_migrates_missing_contract_conservatively() -> None:
+    """Only explicit historical legacy selectors resume ungated when contract is absent."""
+    legacy_seed = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    assert _resolve_resume_fat_harness_mode(legacy_seed, {}) is False
+    assert _resolve_resume_fat_harness_mode(VALID_SEED_DATA, {}) is True
 
 
 def test_resolve_max_decomposition_depth_defaults_to_two(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,6 +351,51 @@ async def test_run_orchestrator_passes_default_fat_harness_mode_to_runner(tmp_pa
         await _run_orchestrator(seed_file)
 
     assert mock_runner_cls.call_args.kwargs["fat_harness_mode"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_orchestrator_resume_uses_persisted_fat_harness_contract(
+    tmp_path: Path,
+) -> None:
+    """Resume trusts the stored session contract instead of revalidating old seed modes."""
+    seed_file = tmp_path / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+
+    tracker = SessionTracker.create(
+        "exec-resume",
+        VALID_SEED_DATA["metadata"]["seed_id"],
+        session_id="sess-resume",
+    )
+    fake_exec = SimpleNamespace(
+        success=True,
+        session_id="sess-resume",
+        messages_processed=1,
+        duration_seconds=1.0,
+        execution_id="exec-resume",
+        summary={},
+        final_message="resumed",
+    )
+    mock_runner = MagicMock()
+    mock_runner.resume_session = AsyncMock(return_value=Result.ok(fake_exec))
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    with (
+        patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=seed_data),
+        patch("ouroboros.orchestrator.create_agent_runtime"),
+        patch(
+            "ouroboros.orchestrator.OrchestratorRunner", return_value=mock_runner
+        ) as mock_runner_cls,
+        patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
+        patch("ouroboros.orchestrator.session.SessionRepository") as mock_repo_cls,
+        patch("ouroboros.cli.commands.run.maybe_restore_task_workspace", return_value=None),
+    ):
+        mock_event_store_cls.return_value.initialize = AsyncMock()
+        mock_repo_cls.return_value.reconstruct_session = AsyncMock(return_value=Result.ok(tracker))
+
+        await _run_orchestrator(seed_file, resume_session="sess-resume", no_qa=True)
+
+    assert mock_runner_cls.call_args.kwargs["fat_harness_mode"] is False
+    mock_runner.resume_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio

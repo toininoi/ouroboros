@@ -446,12 +446,57 @@ class TestOrchestratorRunner:
             )
 
         assert result.is_ok
-        assert result.value is tracker
+        assert result.value.session_id == tracker.session_id
+        assert result.value.progress["fat_harness_mode"] is False
+        assert result.value.messages_processed == 0
         create_session.assert_awaited_once_with(
             execution_id="exec_prepared",
             seed_id=sample_seed.metadata.seed_id,
             session_id="orch_prepared",
             seed_goal=sample_seed.goal,
+        )
+
+    @pytest.mark.asyncio
+    async def test_prepare_session_fails_when_initial_contract_cannot_persist(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        """A gated session must not start if its acceptance contract is not durable."""
+        tracker = SessionTracker.create(
+            "exec_prepared",
+            sample_seed.metadata.seed_id,
+            session_id="orch_prepared",
+        )
+        create_session = AsyncMock(return_value=Result.ok(tracker))
+        track_progress = AsyncMock(return_value=Result.err(ConfigError("store unavailable")))
+        mark_failed = AsyncMock(return_value=Result.ok(None))
+
+        with (
+            patch.object(runner._session_repo, "create_session", create_session),
+            patch.object(runner._session_repo, "track_progress", track_progress),
+            patch.object(runner._session_repo, "mark_failed", mark_failed),
+        ):
+            result = await runner.prepare_session(
+                sample_seed,
+                execution_id="exec_prepared",
+                session_id="orch_prepared",
+            )
+
+        assert result.is_err
+        assert "initial session contract" in result.error.message
+        track_progress.assert_awaited_once_with(
+            "orch_prepared",
+            {"fat_harness_mode": False, "messages_processed": 0},
+        )
+        mark_failed.assert_awaited_once_with(
+            "orch_prepared",
+            "Failed to persist initial session contract",
+            {
+                "execution_id": "exec_prepared",
+                "fat_harness_mode": False,
+                "cause": "store unavailable",
+            },
         )
 
     @pytest.mark.asyncio
@@ -1080,6 +1125,7 @@ class TestOrchestratorRunner:
             mock_event_store,
             mock_console,
             task_workspace=_task_workspace(),
+            fat_harness_mode=False,
         )
 
         with (
@@ -1111,11 +1157,15 @@ class TestOrchestratorRunner:
             mock_event_store,
             mock_console,
             task_workspace=_task_workspace(),
+            fat_harness_mode=False,
         )
         tracker = SessionTracker.create("exec_setup", sample_seed.metadata.seed_id)
 
         with (
             patch.object(runner._session_repo, "create_session", return_value=Result.ok(tracker)),
+            patch.object(
+                runner._session_repo, "track_progress", AsyncMock(return_value=Result.ok(None))
+            ),
             patch.object(
                 runner._event_store,
                 "append",
@@ -1146,6 +1196,7 @@ class TestOrchestratorRunner:
             mock_event_store,
             mock_console,
             task_workspace=_task_workspace(),
+            fat_harness_mode=False,
         )
         tracker = SessionTracker.create("exec_tools", sample_seed.metadata.seed_id)
 
@@ -1200,6 +1251,7 @@ class TestOrchestratorRunner:
             mock_event_store,
             mock_console,
             task_workspace=_task_workspace(),
+            fat_harness_mode=False,
         )
         completed_tracker = SessionTracker.create("exec", "seed").with_status(
             SessionStatus.COMPLETED
@@ -1219,14 +1271,14 @@ class TestOrchestratorRunner:
         release_lock_mock.assert_called_once_with("/tmp/worktree/.locks/repo/orch_test.json")
 
     @pytest.mark.asyncio
-    async def test_fat_harness_resume_is_blocked_before_legacy_direct_execution(
+    async def test_resume_is_blocked_before_ungated_direct_execution(
         self,
         mock_adapter: MagicMock,
         mock_event_store: AsyncMock,
         mock_console: MagicMock,
         sample_seed: Seed,
     ) -> None:
-        """Fat-harness resume must not bypass typed evidence acceptance."""
+        """Resume must not bypass typed evidence acceptance."""
         from ouroboros.core.types import Result
 
         runner = OrchestratorRunner(
@@ -1253,7 +1305,8 @@ class TestOrchestratorRunner:
             result = await runner.resume_session("sess_resume", sample_seed)
 
         assert result.is_err
-        assert "Fat-harness resume is blocked" in result.error.message
+        assert "Resume is blocked" in result.error.message
+        assert "typed evidence plus verifier PASS" in result.error.message
         assert result.error.details["resume_blocked"] == "typed_evidence_gate_required"
         get_merged_tools.assert_not_called()
         execute_task.assert_not_called()
@@ -1275,6 +1328,7 @@ class TestOrchestratorRunner:
             mock_event_store,
             mock_console,
             task_workspace=_task_workspace(),
+            fat_harness_mode=False,
         )
         running_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
             SessionStatus.RUNNING
@@ -2089,12 +2143,20 @@ class TestOrchestratorRunner:
     @pytest.mark.asyncio
     async def test_execute_parallel_passes_execution_profile_to_executor(
         self,
-        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
         sample_seed: Seed,
     ) -> None:
         """Runner wiring should make profile-aware decomposition live in production."""
         from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
 
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            fat_harness_mode=True,
+        )
         tracker = SessionTracker.create("exec_parallel", sample_seed.metadata.seed_id)
         dependency_graph = DependencyGraph(
             nodes=(ACNode(index=0, content=sample_seed.acceptance_criteria[0]),),
@@ -2153,7 +2215,7 @@ class TestOrchestratorRunner:
         assert profile is not None
         assert profile.profile == sample_seed.task_type == "code"
         assert profile.axis == "testable_unit"
-        assert captured_init["fat_harness_mode"] is False
+        assert captured_init["fat_harness_mode"] is True
 
     @pytest.mark.asyncio
     async def test_execute_parallel_passes_fat_harness_mode_to_executor(
@@ -2772,6 +2834,7 @@ class TestOrchestratorRunner:
             mock_console,
             inherited_runtime_handle=inherited_handle,
             inherited_tools=["WebFetch", "mcp__chrome-devtools__click"],
+            fat_harness_mode=False,
         )
 
         from ouroboros.core.types import Result

@@ -122,6 +122,174 @@ class TestExecuteSeedHandler:
         assert result.is_err
         assert "seed_content or seed_path is required" in str(result.error)
 
+    async def test_handle_restores_fat_harness_mode_from_session_contract(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MCP resume preserves the acceptance contract chosen at session creation."""
+        captured_modes: list[bool] = []
+        fresh_tracker = SessionTracker.create("exec_fresh", "seed-123")
+        gated_resume_tracker = SessionTracker.create("exec_resume", "seed-123").with_progress(
+            {"fat_harness_mode": True}
+        )
+        legacy_resume_tracker = SessionTracker.create("exec_legacy", "seed-123")
+        missing_contract_tracker = SessionTracker.create("exec_missing", "seed-123")
+
+        workspace = SimpleNamespace(
+            effective_cwd="/tmp/ouroboros-worktree",
+            worktree_path="/tmp/ouroboros-worktree",
+            branch="ooo/test",
+            lock_path="/tmp/ouroboros.lock",
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                trackers = {
+                    "sess_resume": gated_resume_tracker,
+                    "sess_legacy": legacy_resume_tracker,
+                    "sess_missing": missing_contract_tracker,
+                }
+                return Result.ok(trackers.get(session_id, fresh_tracker))
+
+            async def mark_failed(self, session_id: str, *, error_message: str) -> None:
+                raise AssertionError(f"unexpected failure mark for {session_id}: {error_message}")
+
+        class FakeRunner:
+            def __init__(self, *args: object, fat_harness_mode: bool, **kwargs: object) -> None:
+                captured_modes.append(fat_harness_mode)
+
+            async def prepare_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(fresh_tracker)
+
+            async def execute_precreated_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(
+                    SimpleNamespace(
+                        success=True,
+                        execution_id="exec_fresh",
+                        summary={},
+                        final_message="done",
+                    )
+                )
+
+            async def resume_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(
+                    SimpleNamespace(
+                        success=True,
+                        execution_id="exec_resume",
+                        summary={},
+                        final_message="resumed",
+                    )
+                )
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        monkeypatch.setattr("ouroboros.mcp.tools.execution_handlers.OrchestratorRunner", FakeRunner)
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.create_agent_runtime",
+            lambda **_kwargs: SimpleNamespace(runtime_backend="test"),
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.maybe_prepare_task_workspace",
+            lambda *_args, **_kwargs: workspace,
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.maybe_restore_task_workspace",
+            lambda *_args, **_kwargs: workspace,
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.release_lock", lambda *_args: None
+        )
+
+        handler = ExecuteSeedHandler(event_store=memory_event_store)
+
+        fresh = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "skip_qa": True},
+            synchronous=True,
+        )
+        resumed = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "session_id": "sess_resume", "skip_qa": True},
+            synchronous=True,
+        )
+        legacy_resumed = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                ),
+                "session_id": "sess_legacy",
+                "skip_qa": True,
+            },
+            synchronous=True,
+        )
+        missing_contract_resumed = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML,
+                "session_id": "sess_missing",
+                "skip_qa": True,
+            },
+            synchronous=True,
+        )
+
+        assert fresh.is_ok
+        assert resumed.is_ok
+        assert legacy_resumed.is_ok
+        assert missing_contract_resumed.is_ok
+        assert captured_modes == [True, True, False, True]
+
+    async def test_handle_rejects_removed_legacy_execution_mode(self) -> None:
+        """MCP execute_seed matches the CLI removal of the legacy selector."""
+        handler = ExecuteSeedHandler()
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_err
+        assert "execution_mode='legacy' was removed" in str(result.error)
+
+    async def test_handle_plugin_rejects_removed_legacy_execution_mode(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Plugin-dispatched execute_seed uses the same fresh execution-mode gate."""
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_err
+        assert "execution_mode='legacy' was removed" in str(result.error)
+
+    async def test_handle_rejects_unknown_execution_mode(self) -> None:
+        """MCP execute_seed keeps execution_mode non-configurable like the CLI."""
+        handler = ExecuteSeedHandler()
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: nope\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_err
+        assert "execution_mode is no longer configurable" in str(result.error)
+
     async def test_handle_reports_execution_handler_config_error(self) -> None:
         """Config failures should surface with execution-handler context."""
         handler = ExecuteSeedHandler()
@@ -1462,6 +1630,28 @@ class TestAsyncJobHandlers:
         assert result.is_ok
         assert result.value.meta["execution_id"].startswith("exec_")
         assert result.value.meta["session_id"].startswith("orch_")
+
+    async def test_start_execute_seed_plugin_rejects_removed_legacy_execution_mode(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Plugin-dispatched start_execute_seed uses the same fresh execution-mode gate."""
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_err
+        assert "execution_mode='legacy' was removed" in str(result.error)
 
     def test_job_status_definition_name(self) -> None:
         handler = JobStatusHandler()
