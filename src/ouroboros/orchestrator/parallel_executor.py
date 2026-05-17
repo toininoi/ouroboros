@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 from rich.console import Console
 
+from ouroboros.core.seed_contract_prompt import render_auto_recursion_guard
 from ouroboros.observability.logging import get_logger
 from ouroboros.orchestrator.adapter import (
     AgentMessage,
@@ -4362,6 +4363,8 @@ Files present:
 
 ## Goal Context
 {seed_goal}
+
+{render_auto_recursion_guard()}
 
 {task_section}
 {legacy_context_section}{retry_section}{parallel_section}

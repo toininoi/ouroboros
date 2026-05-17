@@ -36,7 +36,10 @@ from rich.text import Text
 from ouroboros.backends import backend_supports_tool_envelope
 from ouroboros.core.errors import OuroborosError
 from ouroboros.core.seed_contract import SeedContract
-from ouroboros.core.seed_contract_prompt import render_seed_contract_for_execution
+from ouroboros.core.seed_contract_prompt import (
+    render_auto_recursion_guard,
+    render_seed_contract_for_execution,
+)
 from ouroboros.core.types import Result
 from ouroboros.core.worktree import TaskWorkspace, heartbeat_lock, release_lock
 from ouroboros.observability.drift import DriftMeasurement
@@ -337,6 +340,8 @@ def build_task_prompt(
 
 ## Acceptance Criteria
 {ac_list}
+
+{render_auto_recursion_guard()}
 
 {suffix}
 """
